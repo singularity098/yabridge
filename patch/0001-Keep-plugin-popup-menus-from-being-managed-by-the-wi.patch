@@ -1,0 +1,187 @@
+From 9cb7058926ec9dbc552ca150997d8a9c85eef08d Mon Sep 17 00:00:00 2001
+From: singularity098 <michael.adams098@gmail.com>
+Date: Sun, 11 Oct 2026 13:02:37 +0000
+Subject: [PATCH] Keep plugin popup menus from being managed by the window
+ manager
+
+JUCE creates its popup menus (and their drop shadow and tooltip windows)
+as WS_POPUP | WS_SYSMENU top level windows. Wine treats popup windows
+with a system menu as managed windows, so instead of mapping the menu as
+an override-redirect popup it hands it to the window manager as a
+regular top level window. With Wine 10.x and later this makes dropdown
+menus in JUCE plugins like Toontrack Superior Drummer 3 close again
+about 13 ms after they open: the plugin dismisses the menu on its own
+without any Win32 activation, focus or cancel-mode message reaching it.
+The known workarounds (KWin's "extreme" focus stealing prevention, or a
+Wine virtual desktop) both keep the window manager from acting on the
+menu.
+
+While an editor is open, install a WH_CBT hook on the GUI thread that
+strips WS_SYSMENU from newly created captionless, non-resizable top
+level popup windows that don't use WS_EX_APPWINDOW. Wine then maps them
+as override-redirect windows like any native application's menus.
+Regular plugin windows and dialogs are unaffected. The workaround can be
+disabled with YABRIDGE_NO_POPUP_FIX=1, and with +editor debug tracing
+every modified window is logged.
+
+Tested with Superior Drummer 3 in REAPER on KDE Plasma 6 (Wayland) with
+Wine 11.19.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QSpP7HQGFLseCyGWAztX7M
+---
+ src/wine-host/editor.cpp | 82 +++++++++++++++++++++++++++++++++++++++-
+ src/wine-host/editor.h   | 32 ++++++++++++++++
+ 2 files changed, 113 insertions(+), 1 deletion(-)
+
+diff --git a/src/wine-host/editor.cpp b/src/wine-host/editor.cpp
+index 835cd181..1705b6da 100644
+--- a/src/wine-host/editor.cpp
++++ b/src/wine-host/editor.cpp
+@@ -203,6 +203,85 @@ xcb_window_t get_x11_handle(HWND win32_handle) noexcept;
+  */
+ ATOM get_window_class() noexcept;
+ 
++namespace {
++
++bool popup_fix_tracing = false;
++int popup_fix_users = 0;
++HHOOK popup_fix_hook = nullptr;
++
++LRESULT CALLBACK popup_fix_cbt_proc(int code, WPARAM wParam, LPARAM lParam) {
++    if (code == HCBT_CREATEWND) {
++        const HWND window = reinterpret_cast<HWND>(wParam);
++        const LONG style = GetWindowLong(window, GWL_STYLE);
++        const LONG ex_style = GetWindowLong(window, GWL_EXSTYLE);
++
++        // Only captionless, non-resizable popup windows that are not supposed
++        // to show up in the task bar. Regular plugin windows and dialogs are
++        // left alone.
++        if (!(style & WS_CHILD) && (style & WS_POPUP) &&
++            (style & WS_CAPTION) != WS_CAPTION && !(style & WS_THICKFRAME) &&
++            (style & WS_SYSMENU) && !(ex_style & WS_EX_APPWINDOW)) {
++            SetWindowLong(window, GWL_STYLE, style & ~WS_SYSMENU);
++
++            // This goes to STDERR instead of through a `Logger` since the hook
++            // can outlive the editor that installed it. STDERR gets captured
++            // and logged by the plugin side.
++            if (popup_fix_tracing) {
++                std::cerr << "DEBUG: Removed WS_SYSMENU from popup window "
++                          << window << std::hex << " (style 0x" << style
++                          << ", exstyle 0x" << ex_style << std::dec
++                          << ") so Wine won't let the window manager manage it"
++                          << std::endl;
++            }
++        }
++    }
++
++    return CallNextHookEx(nullptr, code, wParam, lParam);
++}
++
++}  // namespace
++
++PopupStyleFixer::PopupStyleFixer(Logger& logger)
++    : active_(getenv("YABRIDGE_NO_POPUP_FIX") == nullptr) {
++    if (!active_) {
++        return;
++    }
++
++    if (popup_fix_users++ == 0) {
++        popup_fix_tracing = logger.editor_tracing_;
++        popup_fix_hook = SetWindowsHookEx(WH_CBT, popup_fix_cbt_proc, nullptr,
++                                          GetCurrentThreadId());
++    }
++}
++
++PopupStyleFixer::~PopupStyleFixer() noexcept {
++    if (!active_ || --popup_fix_users > 0) {
++        return;
++    }
++
++    if (popup_fix_hook) {
++        UnhookWindowsHookEx(popup_fix_hook);
++        popup_fix_hook = nullptr;
++    }
++}
++
++PopupStyleFixer::PopupStyleFixer(PopupStyleFixer&& other) noexcept
++    : active_(other.active_) {
++    other.active_ = false;
++}
++
++PopupStyleFixer& PopupStyleFixer::operator=(PopupStyleFixer&& other) noexcept {
++    if (this != &other) {
++        if (active_ && --popup_fix_users == 0 && popup_fix_hook) {
++            UnhookWindowsHookEx(popup_fix_hook);
++            popup_fix_hook = nullptr;
++        }
++        active_ = other.active_;
++        other.active_ = false;
++    }
++    return *this;
++}
++
+ DeferredWin32Window::DeferredWin32Window(
+     MainContext& main_context,
+     std::shared_ptr<xcb_connection_t> x11_connection,
+@@ -341,7 +420,8 @@ Editor::Editor(MainContext& main_context,
+       host_window_(find_host_window(*x11_connection_,
+                                     parent_window_,
+                                     xcb_wm_window_role_property_)
+-                       .value_or(parent_window_)) {
++                       .value_or(parent_window_)),
++      popup_style_fixer_(logger) {
+     logger.log_editor_trace([&]() {
+         return "DEBUG: host_window: " + std::to_string(host_window_);
+     });
+diff --git a/src/wine-host/editor.h b/src/wine-host/editor.h
+index 1dc61551..fba7bc03 100644
+--- a/src/wine-host/editor.h
++++ b/src/wine-host/editor.h
+@@ -125,6 +125,32 @@ class DeferredWin32Window {
+     std::shared_ptr<xcb_connection_t> x11_connection_;
+ };
+ 
++/**
++ * Prevents Wine from handing plugin popup windows (like JUCE's popup menus) to
++ * the window manager, for as long as at least one instance exists. JUCE creates
++ * its popup menus with `WS_POPUP | WS_SYSMENU`, and Wine treats popup windows
++ * with a system menu as managed top level windows instead of override-redirect
++ * popups. Window managers like KWin then treat the menu as a regular window,
++ * which with Wine 10.x and later causes the menu to close again right after
++ * it opens. We strip `WS_SYSMENU` from captionless, non-resizable top level
++ * popup windows created on the GUI thread so Wine maps them as override-redirect
++ * windows, just like a native application's menus. This can be disabled by
++ * setting `YABRIDGE_NO_POPUP_FIX`.
++ */
++class PopupStyleFixer {
++   public:
++    explicit PopupStyleFixer(Logger& logger);
++    ~PopupStyleFixer() noexcept;
++
++    PopupStyleFixer(const PopupStyleFixer&) = delete;
++    PopupStyleFixer& operator=(const PopupStyleFixer&) = delete;
++    PopupStyleFixer(PopupStyleFixer&& other) noexcept;
++    PopupStyleFixer& operator=(PopupStyleFixer&& other) noexcept;
++
++   private:
++    bool active_ = false;
++};
++
+ /**
+  * TODO: This documentation needs to be updated with the recent changes to how
+  *       embedding is handled.
+@@ -442,4 +468,10 @@ class Editor {
+      * `supports_ewmh_active_window()`.
+      */
+     mutable std::optional<bool> supports_ewmh_active_window_cache_;
++
++    /**
++     * Keeps plugin popup windows, like JUCE's popup menus, from being managed
++     * by the window manager while this editor is open.
++     */
++    PopupStyleFixer popup_style_fixer_;
+ };
+-- 
+2.43.0
+
